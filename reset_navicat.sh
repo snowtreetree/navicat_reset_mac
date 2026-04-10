@@ -5,68 +5,114 @@ set -uo pipefail  # 启用严格错误处理 / Enable strict error handling
 APP_NAME="Navicat Premium"
 APP_SUPPORT_DIR="$HOME/Library/Application Support/PremiumSoft CyberTech/Navicat CC/Navicat Premium"
 PLIST_FILE="$HOME/Library/Preferences/com.navicat.NavicatPremium.plist"
+PREFS_DOMAIN="com.navicat.NavicatPremium"
 KEYCHAIN_SERVICE="com.navicat.NavicatPremium"
 
 # ---------- 终止 Navicat 进程 / Terminate Navicat process ----------
 echo "正在终止 $APP_NAME 进程... / Terminating $APP_NAME process..."
-if pkill -9 "$APP_NAME" 2>/dev/null; then
+killall "$APP_NAME" 2>/dev/null || true
+if pkill -9 -f "Navicat Premium" 2>/dev/null; then
   echo "已成功终止正在运行的 $APP_NAME 进程。/ Successfully terminated running $APP_NAME process."
 else
-  echo "$APP_NAME 进程未在运行，跳过终止。/ $APP_NAME process not running, skipping termination."
+  echo "$APP_NAME 进程未在运行或已由 killall 结束。/ $APP_NAME not running or already quit."
 fi
 
 # ---------- 清理应用支持目录的哈希文件 / Cleaning hash files in app support directory ----------
 echo "清理应用支持目录的哈希文件... / Cleaning hash files in app support directory..."
-find "$APP_SUPPORT_DIR" -maxdepth 1 -type f -name '.[0-9A-F][0-9A-F]*' 2>/dev/null | \
-while IFS= read -r file; do
-  filename=$(basename "$file")
-  # 基础正则表达式匹配 32 位哈希 / Basic regex to match 32-character hash
-  if echo "$filename" | grep -Eq '^\.([0-9A-F]{32})$'; then
-    echo "删除哈希文件: $filename / Deleting hash file: $filename"
-    rm -f "$file"
-  fi
-done
+if [[ -d "$APP_SUPPORT_DIR" ]]; then
+  find "$APP_SUPPORT_DIR" -maxdepth 1 -type f -name '.[0-9A-Fa-f][0-9A-Fa-f]*' 2>/dev/null | \
+  while IFS= read -r file; do
+    filename=$(basename "$file")
+    if echo "$filename" | grep -Eq '^\.([0-9A-Fa-f]{32})$'; then
+      echo "删除哈希文件: $filename / Deleting hash file: $filename"
+      rm -f "$file"
+    fi
+  done
+else
+  echo "应用支持目录不存在，跳过: $APP_SUPPORT_DIR / App support dir missing, skipping."
+fi
+
+# ---------- 收集 plist 中 32 位十六进制顶级键 / Collect top-level 32-hex keys ----------
+collect_hash_keys_from_plist() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  {
+    /usr/libexec/PlistBuddy -c "Print" "$f" 2>/dev/null | grep -Eoa '^\s{4}[0-9A-Fa-f]{32}' | tr -d ' '
+    plutil -p "$f" 2>/dev/null | grep -Eo '"[0-9A-Fa-f]{32}"\s*=>' | grep -Eo '[0-9A-Fa-f]{32}'
+  } | grep -E '^[0-9A-Fa-f]{32}$' | sort -u
+}
 
 # ---------- 处理偏好设置文件 / Handling preferences plist file ----------
 echo "处理偏好设置文件... / Processing preferences plist file..."
 if [[ -f "$PLIST_FILE" ]]; then
-  # 获取所有符合32位哈希格式的顶级键 / Get all top-level keys matching 32-character hash
-  keys_to_delete=$(/usr/libexec/PlistBuddy -c "Print" "$PLIST_FILE" | grep -Eoa "^\s{4}[0-9A-F]{32}" | tr -d ' ')
+  keys_to_delete=$(collect_hash_keys_from_plist "$PLIST_FILE")
   if [[ -n "$keys_to_delete" ]]; then
     while IFS= read -r key; do
-      echo "正在删除密钥: $key / Deleting key: $key"
+      [[ -z "$key" ]] && continue
+      echo "正在删除偏好键: $key / Removing prefs key: $key"
+      defaults delete "$PREFS_DOMAIN" "$key" 2>/dev/null || true
       /usr/libexec/PlistBuddy -c "Delete :$key" "$PLIST_FILE" 2>/dev/null || true
     done <<< "$keys_to_delete"
   else
     echo "未找到需要删除的32位哈希密钥。/ No 32-character hash keys found to delete."
   fi
+  # 避免 cfprefsd 缓存导致仍读到旧试用状态 / avoid stale prefs cache
+  killall cfprefsd 2>/dev/null || true
 else
   echo "偏好设置文件不存在: $PLIST_FILE / Preferences plist file not found: $PLIST_FILE"
 fi
 
+# ---------- 从 security dump-keychain 文本中提取 Navicat 试用哈希账户 / Parse keychain dump ----------
+# 在遇到含服务名的行后，下一条含 "acct" 的行里取 32 位十六进制 blob（与条目顺序一致）
+extract_hash_accounts_from_dump_text() {
+  local want_acct=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"$KEYCHAIN_SERVICE"* ]]; then
+      want_acct=1
+      continue
+    fi
+    if [[ $want_acct -eq 1 && "$line" == *'"acct"'* ]]; then
+      if [[ "$line" =~ \"([0-9A-Fa-f]{32})\" ]]; then
+        echo "${BASH_REMATCH[1]}"
+      fi
+      want_acct=0
+    fi
+  done
+}
+
 # ---------- 清理钥匙串中的试用期追踪条目 / Clean trial tracking entries in Keychain ----------
 echo "清理钥匙串中的试用期追踪条目... / Cleaning trial tracking entries in Keychain..."
-# 获取所有 Navicat 钥匙串条目的账户名 / Get all Navicat keychain entry account names
-# 使用 awk 提取紧跟在服务名后的账户名 / Use awk to extract account names following service name
-keychain_accounts=$(security dump-keychain ~/Library/Keychains/login.keychain-db 2>/dev/null | \
-  awk '/0x00000007.*'"$KEYCHAIN_SERVICE"'/{found=1} found && /"acct"/{print; found=0}' | \
-  sed 's/.*<blob>="\([^"]*\)".*/\1/')
+tmp_accounts=$(mktemp "${TMPDIR:-/tmp}/navicat_kc.XXXXXX")
+trap 'rm -f "$tmp_accounts"' EXIT
+
+for kc in "$HOME/Library/Keychains/login.keychain-db" "$HOME/Library/Keychains/"*.keychain-db; do
+  [[ -r "$kc" ]] || continue
+  security dump-keychain "$kc" 2>/dev/null | extract_hash_accounts_from_dump_text >>"$tmp_accounts" || true
+done
+
+# 兼容旧版 awk 解析（部分系统上字段顺序不同）/ legacy awk path
+for kc in "$HOME/Library/Keychains/login.keychain-db" "$HOME/Library/Keychains/"*.keychain-db; do
+  [[ -r "$kc" ]] || continue
+  security dump-keychain "$kc" 2>/dev/null | \
+    awk '/0x00000007.*'"$KEYCHAIN_SERVICE"'/{found=1} found && /"acct"/{print; found=0}' | \
+    sed -E 's/.*<blob>="([^"]*)".*/\1/' >>"$tmp_accounts" || true
+done
 
 deleted_count=0
-if [[ -n "$keychain_accounts" ]]; then
-  while IFS= read -r account; do
-    # 只删除32位哈希格式的账户（试用期追踪），保留用户的连接密码
-    # Only delete 32-character hash accounts (trial tracking), preserve user connection passwords
-    if echo "$account" | grep -Eq '^[0-9A-F]{32}$'; then
-      echo "删除钥匙串条目: $account / Deleting keychain entry: $account"
-      security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$account" >/dev/null 2>&1 || true
-      ((deleted_count++))
+while IFS= read -r account; do
+  [[ -z "$account" ]] && continue
+  if echo "$account" | grep -Eq '^[0-9A-Fa-f]{32}$'; then
+    echo "删除钥匙串条目: $account / Deleting keychain entry: $account"
+    if security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$account" >/dev/null 2>&1; then
+      ((deleted_count++)) || true
     fi
-  done <<< "$keychain_accounts"
-fi
+  fi
+done < <(sort -u "$tmp_accounts" 2>/dev/null)
 
 if [[ $deleted_count -eq 0 ]]; then
-  echo "未找到需要删除的钥匙串条目。/ No keychain entries found to delete."
+  echo "未找到需要删除的钥匙串条目（或已清空）。/ No keychain trial entries removed."
 else
   echo "已删除 $deleted_count 个钥匙串条目。/ Deleted $deleted_count keychain entries."
 fi
+
+echo "完成。若仍显示过期：请重启 Mac，或按 README 完全卸载后重装。/ Done. Reboot or full uninstall per README if still expired."
