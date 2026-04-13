@@ -1,5 +1,7 @@
 # navicat16/17 mac版无限重置试用期脚本
 
+## 自用～～～，原始脚本，本人电脑上总是重置失败
+
 <!-- @import "[TOC]" {cmd="toc" depthFrom=1 depthTo=6 orderedList=false} -->
 
 [English](README_en.md)
